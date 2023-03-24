@@ -1,3 +1,16 @@
+##  ‼‼‼🔷🔷🔷CA Fork of Amazon Elastic Block Store (EBS) CSI driver 🔷🔷🔷‼‼‼
+
+### 🔹🔹🔹 Summary of Changes
+
+Added tolerations to controller.yaml to allow scheduling on the control-plane, specifically:
+
+```yaml
+  - effect: NoSchedule
+    key: node-role.kubernetes.io/master
+  - effect: NoSchedule
+    key: node-role.kubernetes.io/control-plane
+```
+
 > **Warning**
 > 
 > [`k8s.gcr.io` will be redirected on Monday March 20th](https://kubernetes.io/blog/2023/03/10/image-registry-redirect/), and may stop working entirely in the near future. If you are using `k8s.gcr.io` you MUST [move to `registry.k8s.io`](https://kubernetes.io/blog/2023/02/06/k8s-gcr-io-freeze-announcement/) to continue receiving support.
