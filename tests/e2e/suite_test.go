@@ -23,15 +23,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/plugin"
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/util"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	"k8s.io/kubernetes/test/e2e/framework"
 	frameworkconfig "k8s.io/kubernetes/test/e2e/framework/config"
 )
 
 const kubeconfigEnvVar = "KUBECONFIG"
 
+//nolint:gochecknoinits
 func init() {
 	rand.New(rand.NewSource(time.Now().UnixNano()))
 	testing.Init()
@@ -47,6 +49,16 @@ func init() {
 	framework.RegisterCommonFlags(flag.CommandLine)
 	framework.RegisterClusterFlags(flag.CommandLine)
 	flag.Parse()
+
+	// Set driver name using same method as main.go (to allow E2E testing with plugins)
+	// TODO: Figure out a cleaner way to do this
+	driverName := "ebs.csi.aws.com"
+	if plugin := plugin.GetPlugin(); plugin != nil {
+		if pluginDriverName := plugin.GetDriverName(); pluginDriverName != "" {
+			driverName = pluginDriverName
+		}
+	}
+	util.SetDriverName(driverName)
 }
 
 func TestE2E(t *testing.T) {

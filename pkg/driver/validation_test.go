@@ -17,34 +17,17 @@ limitations under the License.
 package driver
 
 import (
+	"errors"
 	"fmt"
-	"math/rand"
 	"reflect"
-	"strconv"
 	"testing"
+	"time"
 
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/cloud"
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/util"
 )
 
-func randomString(n int) string {
-	var letter = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letter[rand.Intn(len(letter))]
-	}
-	return string(b)
-}
-
-func randomStringMap(n int) map[string]string {
-	result := map[string]string{}
-	for i := 0; i < n; i++ {
-		result[strconv.Itoa(i)] = randomString(10)
-	}
-	return result
-}
-
-func TestValidateExtraVolumeTags(t *testing.T) {
+func TestValidateExtraTags(t *testing.T) {
 	testCases := []struct {
 		name   string
 		tags   map[string]string
@@ -58,51 +41,60 @@ func TestValidateExtraVolumeTags(t *testing.T) {
 			expErr: nil,
 		},
 		{
-			name: "invalid tag: key too long",
-			tags: map[string]string{
-				randomString(cloud.MaxTagKeyLength + 1): "extra-tag-value",
-			},
-			expErr: fmt.Errorf("Tag key too long (actual: %d, limit: %d)", cloud.MaxTagKeyLength+1, cloud.MaxTagKeyLength),
-		},
-		{
-			name: "invalid tag: value too long",
-			tags: map[string]string{
-				"extra-tag-key": randomString(cloud.MaxTagValueLength + 1),
-			},
-			expErr: fmt.Errorf("Tag value too long (actual: %d, limit: %d)", cloud.MaxTagValueLength+1, cloud.MaxTagValueLength),
-		},
-		{
 			name: "invalid tag: reserved CSI key",
 			tags: map[string]string{
 				cloud.VolumeNameTagKey: "extra-tag-value",
 			},
-			expErr: fmt.Errorf("Tag key '%s' is reserved", cloud.VolumeNameTagKey),
+			expErr: fmt.Errorf("tag key '%s' is reserved", cloud.VolumeNameTagKey),
 		},
 		{
 			name: "invalid tag: reserved driver key",
 			tags: map[string]string{
 				cloud.AwsEbsDriverTagKey: "false",
 			},
-			expErr: fmt.Errorf("Tag key '%s' is reserved", cloud.AwsEbsDriverTagKey),
+			expErr: fmt.Errorf("tag key prefix '%s/' is reserved", util.GetDriverName()),
+		},
+		{
+			name: "invalid tag: reserved IOPSPerGb key",
+			tags: map[string]string{
+				cloud.IOPSPerGBKey: "100",
+			},
+			expErr: fmt.Errorf("tag key prefix '%s/' is reserved", util.GetDriverName()),
+		},
+		{
+			name: "invalid tag: reserved AllowAutoIOPSIncreaseOnModify key",
+			tags: map[string]string{
+				cloud.AllowAutoIOPSIncreaseOnModifyKey: "true",
+			},
+			expErr: fmt.Errorf("tag key prefix '%s/' is reserved", util.GetDriverName()),
+		},
+		{
+			name: "invalid tag: reserved driver name prefix",
+			tags: map[string]string{
+				util.GetDriverName() + "/anything": "value",
+			},
+			expErr: fmt.Errorf("tag key prefix '%s/' is reserved", util.GetDriverName()),
+		},
+		{
+			name: "invaid tag: reserved snapshot key",
+			tags: map[string]string{
+				cloud.SnapshotNameTagKey: "false",
+			},
+			expErr: fmt.Errorf("tag key '%s' is reserved", cloud.SnapshotNameTagKey),
 		},
 		{
 			name: "invalid tag: reserved Kubernetes key prefix",
 			tags: map[string]string{
 				cloud.KubernetesTagKeyPrefix + "/cluster": "extra-tag-value",
 			},
-			expErr: fmt.Errorf("Tag key prefix '%s' is reserved", cloud.KubernetesTagKeyPrefix),
+			expErr: fmt.Errorf("tag key prefix '%s' is reserved", cloud.KubernetesTagKeyPrefix),
 		},
 		{
-			name: "invalid tag: reserved AWS key prefix",
+			name: "invalid tag: reserved cluster name key",
 			tags: map[string]string{
-				cloud.AWSTagKeyPrefix + "foo": "extra-tag-value",
+				ClusterNameTagKey: "my-cluster",
 			},
-			expErr: fmt.Errorf("Tag key prefix '%s' is reserved", cloud.AWSTagKeyPrefix),
-		},
-		{
-			name:   "invalid tag: too many tags",
-			tags:   randomStringMap(cloud.MaxNumTagsPerResource + 1),
-			expErr: fmt.Errorf("Too many tags (actual: %d, limit: %d)", cloud.MaxNumTagsPerResource+1, cloud.MaxNumTagsPerResource),
+			expErr: fmt.Errorf("tag key '%s' is reserved", ClusterNameTagKey),
 		},
 	}
 
@@ -111,6 +103,48 @@ func TestValidateExtraVolumeTags(t *testing.T) {
 			err := validateExtraTags(tc.tags, false)
 			if !reflect.DeepEqual(err, tc.expErr) {
 				t.Fatalf("error not equal\ngot:\n%s\nexpected:\n%s", err, tc.expErr)
+			}
+		})
+	}
+}
+
+func TestValidateExtraTagsWarnOnly(t *testing.T) {
+	testCases := []struct {
+		name         string
+		tags         map[string]string
+		expectedTags map[string]string
+	}{
+		{
+			name: "valid tags are preserved",
+			tags: map[string]string{
+				"extra-tag-key": "extra-tag-value",
+			},
+			expectedTags: map[string]string{
+				"extra-tag-key": "extra-tag-value",
+			},
+		},
+		{
+			name: "reserved keys are removed",
+			tags: map[string]string{
+				cloud.VolumeNameTagKey:   "attacker-vol-name",
+				cloud.SnapshotNameTagKey: "attacker-snap-name",
+				ClusterNameTagKey:        "attacker-cluster",
+				"valid-key":              "valid-value",
+			},
+			expectedTags: map[string]string{
+				"valid-key": "valid-value",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateExtraTags(tc.tags, true)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(tc.tags, tc.expectedTags) {
+				t.Fatalf("tags not equal\ngot:\n%v\nexpected:\n%v", tc.tags, tc.expectedTags)
 			}
 		})
 	}
@@ -140,7 +174,7 @@ func TestValidateMode(t *testing.T) {
 		{
 			name:   "invalid mode: unknown",
 			mode:   Mode("unknown"),
-			expErr: fmt.Errorf("Mode is not supported (actual: unknown, supported: %v)", []Mode{AllMode, ControllerMode, NodeMode}),
+			expErr: fmt.Errorf("mode is not supported (actual: unknown, supported: %v)", []Mode{AllMode, ControllerMode, NodeMode}),
 		},
 	}
 
@@ -156,36 +190,47 @@ func TestValidateMode(t *testing.T) {
 
 func TestValidateDriverOptions(t *testing.T) {
 	testCases := []struct {
-		name            string
-		mode            Mode
-		extraVolumeTags map[string]string
-		expErr          error
+		name                string
+		mode                Mode
+		extraVolumeTags     map[string]string
+		modifyVolumeTimeout time.Duration
+		expErr              error
 	}{
 		{
-			name:   "success",
-			mode:   AllMode,
-			expErr: nil,
+			name:                "success",
+			mode:                AllMode,
+			modifyVolumeTimeout: 5 * time.Second,
+			expErr:              nil,
 		},
 		{
-			name:   "fail because validateMode fails",
-			mode:   Mode("unknown"),
-			expErr: fmt.Errorf("Invalid mode: %w", fmt.Errorf("Mode is not supported (actual: unknown, supported: %v)", []Mode{AllMode, ControllerMode, NodeMode})),
+			name:                "fail because validateMode fails",
+			mode:                Mode("unknown"),
+			modifyVolumeTimeout: 5 * time.Second,
+			expErr:              fmt.Errorf("invalid mode: %w", fmt.Errorf("mode is not supported (actual: unknown, supported: %v)", []Mode{AllMode, ControllerMode, NodeMode})),
 		},
 		{
 			name: "fail because validateExtraVolumeTags fails",
 			mode: AllMode,
 			extraVolumeTags: map[string]string{
-				randomString(cloud.MaxTagKeyLength + 1): "extra-tag-value",
+				cloud.AwsEbsDriverTagKey: "extra-tag-value",
 			},
-			expErr: fmt.Errorf("Invalid extra tags: %w", fmt.Errorf("Tag key too long (actual: %d, limit: %d)", cloud.MaxTagKeyLength+1, cloud.MaxTagKeyLength)),
+			modifyVolumeTimeout: 5 * time.Second,
+			expErr:              fmt.Errorf("invalid extra tags: %w", fmt.Errorf("tag key prefix '%s/' is reserved", util.GetDriverName())),
+		},
+		{
+			name:                "fail because modifyVolumeRequestHandlerTimeout is zero",
+			mode:                AllMode,
+			modifyVolumeTimeout: 0,
+			expErr:              errors.New("invalid modifyVolumeRequestHandlerTimeout: timeout cannot be zero"),
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateDriverOptions(&DriverOptions{
-				extraTags: tc.extraVolumeTags,
-				mode:      tc.mode,
+			err := ValidateDriverOptions(&Options{
+				ExtraTags:                         tc.extraVolumeTags,
+				Mode:                              tc.mode,
+				ModifyVolumeRequestHandlerTimeout: tc.modifyVolumeTimeout,
 			})
 			if !reflect.DeepEqual(err, tc.expErr) {
 				t.Fatalf("error not equal\ngot:\n%s\nexpected:\n%s", err, tc.expErr)

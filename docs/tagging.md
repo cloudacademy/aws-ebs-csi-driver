@@ -7,11 +7,12 @@ To help manage volumes in the aws account, CSI driver will automatically add tag
 | CSIVolumeSnapshotName  | volumeSnapshotContentName | CSIVolumeSnapshotName = snapcontent-69477690-803b-4d3e-a61a-03c7b2592a76 | add to all snapshots, for recording associated VolumeSnapshot id and checking if a given snapshot was already created                                    |
 | ebs.csi.aws.com/cluster| true                      | ebs.csi.aws.com/cluster = true                                      | add to all volumes and snapshots, for allowing users to use a policy to limit csi driver's permission to just the resources it manages.                      |
 | kubernetes.io/cluster/X| owned                     | kubernetes.io/cluster/aws-cluster-id-1 = owned                      | add to all volumes and snapshots if k8s-tag-cluster-id argument is set to X.|
+| ebs.csi.aws.com/cluster-name | cluster-name | ebs.csi.aws.com/cluster-name = my-cluster | add to all volumes and snapshots if k8s-tag-cluster-id argument is set, for cluster-scoped IAM policies.|
 | extra-key              | extra-value               | extra-key = extra-value                                             | add to all volumes and snapshots if extraTags argument is set|
 
 # StorageClass Tagging
 
-The AWS EBS CSI Driver supports tagging through `StorageClass.parameters` (in v1.6.0 and later). 
+The AWS EBS CSI Driver supports tagging through `StorageClass.parameters`. 
 
 If a key has the prefix `tagSpecification`, the CSI driver will treat the value as a key-value pair to be applied to the dynamically provisioned volume as tags.
 
@@ -29,7 +30,7 @@ parameters:
   tagSpecification_3: "key3="
 ```
 
-Provisioning a volume using this StorageClass will apply two tags:
+Provisioning a volume using this StorageClass will apply three tags:
 
 ```
 key1=value1
@@ -96,6 +97,94 @@ backup=true
 billingID=ABCDEF
 ```
 
+# Adding, Modifying, and Deleting Tags Of Existing Volumes
+The AWS EBS CSI Driver supports the modifying of tags of existing volumes through `VolumeAttributesClass.parameters` the examples below show the syntax for addition, modification, and deletion of tags within the `VolumeAttributesClass.parameters`. The driver also supports runtime string interpolation on tag values for a volume upon modification, which allows the specification of placeholder values for the PVC namespace, PVC name, and PV name, which will then be dynamically computed at runtime. 
+
+**Note: Interpolated tags require the `--extra-modify-metadata` flag to be enabled on the `external-resizer` sidecar. To modify Amazon EBS resource tags through VACs, ensure that you attach the following IAM Policy to the role used by your Amazon EBS CSI driver:** 
+``` 
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags"
+      ],
+      "Resource": [
+        "arn:aws:ec2:*:*:volume/*",
+        "arn:aws:ec2:*:*:snapshot/*"
+      ]
+    }
+  ]
+}
+```
+**Syntax for Adding or Modifying a Tag**
+
+If a key has the prefix `tagSpecification`, the CSI driver will treat the value as a key-value pair to be added to the existing volume. If there is already an existing tag with the specified key, the CSI driver will overwrite the value of that tag with the new value specified. 
+```
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttributesClass
+metadata:
+  name: io2-class
+driverName: ebs.csi.aws.com
+parameters:
+  tagSpecification_1: "location=Seattle"
+  tagSpecification_2: "cost-center=" // If the value is left blank, tag is created with an empty value
+  # Interpolated tag
+  tagSpecification_3: "PVC-Name={{ .PVCName }}"
+  tagSpecification_4: "PVC-Namespace={{ .PVCNamespace }}"
+  tagSpecification_5: "PV-Name={{ .PVName }}"
+  # Interpolated tag w/ function
+  tagSpecification_6: 'key6={{ .PVCNamespace | contains "prod" }}'
+```
+**Syntax for Deleting a Tag**
+
+If a key has the prefix `tagDeletion`, the CSI driver will treat the value as a tag key, and the existing tag with that key will be removed from the volume.
+```
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttributesClass
+metadata:
+  name: io2-class
+driverName: ebs.csi.aws.com
+parameters:
+  tagDeletion_1: "location" // Deletes tag with key "location"
+  tagDeletion_2: "cost-center"
+```
+
+# Snapshot Tagging
+The AWS EBS CSI Driver supports tagging snapshots through `VolumeSnapshotClass.parameters`, similarly to StorageClass tagging.
+
+The CSI driver supports runtime string interpolation on the snapshot tag values. You can specify placeholders for VolumeSnapshot namespace, VolumeSnapshot name and VolumeSnapshotContent name, which will then be dynamically computed at runtime. You can also use the functions provided by the CSI Driver to apply more expressive tags. **Note: Interpolated tags require the `--extra-create-metadata` flag to be enabled on the `external-snapshotter` sidecar.**
+
+**Example**
+```
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: csi-aws-vsc
+driver: ebs.csi.aws.com
+deletionPolicy: Delete
+parameters:
+  tagSpecification_1: "key1=value1"
+  tagSpecification_2: "key2="
+  # Interpolated tag
+  tagSpecification_3: "snapshotnamespace={{ .VolumeSnapshotNamespace }}"
+  tagSpecification_4: "snapshotname={{ .VolumeSnapshotName }}"
+  tagSpecification_5: "snapshotcontentname={{ .VolumeSnapshotContentName }}"
+  # Interpolated tag w/ function
+  tagSpecification_6: 'key6={{ .VolumeSnapshotNamespace | contains "prod" }}'
+```
+
+Provisioning a snapshot in namespace 'ns-prod' with `VolumeSnapshot` name being 'ebs-snapshot' using this VolumeSnapshotClass, will apply the following tags to the snapshot:
+
+```
+key1=value1
+key2=<empty string>
+snapshotnamespace=ns-prod
+snapshotname=ebs-snapshot
+snapshotcontentname=<the computed VolumeSnapshotContent name>
+key6=true
+```
 ____
 
 ## Failure Modes

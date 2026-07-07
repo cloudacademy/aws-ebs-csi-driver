@@ -15,13 +15,13 @@ limitations under the License.
 package testsuites
 
 import (
+	volumesnapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
+	ebscsidriver "github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/driver"
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/tests/e2e/driver"
-
+	. "github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	restclientset "k8s.io/client-go/rest"
-
-	. "github.com/onsi/ginkgo/v2"
 )
 
 // DynamicallyProvisionedVolumeSnapshotTest will provision required StorageClass(es),VolumeSnapshotClass(es), PVC(s) and Pod(s)
@@ -29,11 +29,13 @@ import (
 // Testing if the Pod(s) can write and read to mounted volumes
 // Create a snapshot, validate the data is still on the disk, and then write and read to it again
 // And finally delete the snapshot
-// This test only supports a single volume
+// This test only supports a single volume.
 type DynamicallyProvisionedVolumeSnapshotTest struct {
-	CSIDriver   driver.PVTestDriver
-	Pod         PodDetails
-	RestoredPod PodDetails
+	CSIDriver    driver.PVTestDriver
+	Pod          PodDetails
+	RestoredPod  PodDetails
+	Parameters   map[string]string
+	ValidateFunc func(*volumesnapshotv1.VolumeSnapshot)
 }
 
 func (t *DynamicallyProvisionedVolumeSnapshotTest) Run(client clientset.Interface, restclient restclientset.Interface, namespace *v1.Namespace) {
@@ -48,18 +50,35 @@ func (t *DynamicallyProvisionedVolumeSnapshotTest) Run(client clientset.Interfac
 	By("deploying the pod")
 	tpod.Create()
 	defer tpod.Cleanup()
-	By("checking that the pods command exits with no error")
+	By("checking that the pod's command exits with no error")
 	tpod.WaitForSuccess()
 
 	By("taking snapshots")
-	tvsc, cleanup := CreateVolumeSnapshotClass(restclient, namespace, t.CSIDriver)
+	tvsc, cleanup := CreateVolumeSnapshotClass(restclient, namespace, t.CSIDriver, t.Parameters)
 	defer cleanup()
 
 	snapshot := tvsc.CreateSnapshot(tpvc.persistentVolumeClaim)
 	defer tvsc.DeleteSnapshot(snapshot)
+
+	// If tests try to lock snapshot, we unlock before cleanup
+	if t.Parameters != nil {
+		lockKeys := []string{
+			ebscsidriver.LockMode,
+			ebscsidriver.LockDuration,
+			ebscsidriver.LockExpirationDate,
+			ebscsidriver.LockCoolOffPeriod,
+		}
+		for _, lockKey := range lockKeys {
+			if _, exists := t.Parameters[lockKey]; exists {
+				defer tvsc.unlockSnapshot(snapshot)
+				break
+			}
+		}
+	}
+
 	tvsc.ReadyToUse(snapshot)
 
-	t.RestoredPod.Volumes[0].DataSource = &DataSource{Name: snapshot.Name}
+	t.RestoredPod.Volumes[0].DataSource = &DataSource{Name: snapshot.Name, Kind: VolumeSnapshotKind}
 	trpod := NewTestPod(client, namespace, t.RestoredPod.Cmd)
 	rvolume := t.RestoredPod.Volumes[0]
 	trpvc, rpvcCleanup := rvolume.SetupDynamicPersistentVolumeClaim(client, namespace, t.CSIDriver)
@@ -71,6 +90,11 @@ func (t *DynamicallyProvisionedVolumeSnapshotTest) Run(client clientset.Interfac
 	By("deploying a second pod with a volume restored from the snapshot")
 	trpod.Create()
 	defer trpod.Cleanup()
-	By("checking that the pods command exits with no error")
+	By("checking that the second pod's command exits with no error")
 	trpod.WaitForSuccess()
+
+	By("validating that expected events happened via AWS API")
+	if t.ValidateFunc != nil {
+		t.ValidateFunc(snapshot)
+	}
 }

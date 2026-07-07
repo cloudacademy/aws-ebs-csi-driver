@@ -21,9 +21,15 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/awslabs/volume-modifier-for-k8s/pkg/rpc"
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/cloud"
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/cloud/metadata"
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/mounter"
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/util"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 )
 
@@ -37,107 +43,125 @@ const (
 	NodeMode Mode = "node"
 	// AllMode is the mode that only starts both the controller and the node service.
 	AllMode Mode = "all"
+
+	// MetadataLabelerMode is the mode that starts the metadata labeler.
+	MetadataLabelerMode Mode = "metadataLabeler"
 )
 
 const (
-	DriverName      = "ebs.csi.aws.com"
-	AwsPartitionKey = "topology." + DriverName + "/partition"
-	AwsAccountIDKey = "topology." + DriverName + "/account-id"
-	AwsRegionKey    = "topology." + DriverName + "/region"
-	AwsOutpostIDKey = "topology." + DriverName + "/outpost-id"
+	WellKnownZoneTopologyKey = "topology.kubernetes.io/zone"
+	// ZoneIDTopologyKey name is purposefully consistent with the CCM's ZoneID topology key.
+	// This key is only used for provisioning by az-id and will not be used for node topology
+	// to prevent any backwards compatibility issues.
+	ZoneIDTopologyKey = "topology.k8s.aws/zone-id"
+	OSTopologyKey     = "kubernetes.io/os"
+)
 
-	WellKnownTopologyKey = "topology.kubernetes.io/zone"
-	// DEPRECATED Use the WellKnownTopologyKey instead
-	TopologyKey = "topology." + DriverName + "/zone"
+// Initialized in NewDriver (depend on driver name).
+var (
+	AgentNotReadyNodeTaintKey string
+	AwsPartitionKey           string
+	AwsAccountIDKey           string
+	AwsRegionKey              string
+	AwsOutpostIDKey           string
+	// Deprecated: Use the WellKnownZoneTopologyKey instead.
+	ZoneTopologyKey string
 )
 
 type Driver struct {
-	controllerService
-	nodeService
-
-	srv     *grpc.Server
-	options *DriverOptions
+	controller *ControllerService
+	node       *NodeService
+	srv        *grpc.Server
+	options    *Options
+	csi.UnimplementedIdentityServer
 }
 
-type DriverOptions struct {
-	endpoint            string
-	extraTags           map[string]string
-	mode                Mode
-	volumeAttachLimit   int64
-	kubernetesClusterID string
-	awsSdkDebugLog      bool
-	warnOnInvalidTag    bool
+// initVariables initializes variables that depend on driver name.
+// Separated into a spearate function from NewDriver so it can be called in tests.
+func initVariables() {
+	AwsPartitionKey = "topology." + util.GetDriverName() + "/partition"
+	AwsAccountIDKey = "topology." + util.GetDriverName() + "/account-id"
+	AwsRegionKey = "topology." + util.GetDriverName() + "/region"
+	AwsOutpostIDKey = "topology." + util.GetDriverName() + "/outpost-id"
+	// Deprecated: Use the WellKnownZoneTopologyKey instead.
+	ZoneTopologyKey = "topology." + util.GetDriverName() + "/zone"
+	AgentNotReadyNodeTaintKey = util.GetDriverName() + "/agent-not-ready"
 }
 
-func NewDriver(options ...func(*DriverOptions)) (*Driver, error) {
-	klog.InfoS("Driver Information", "Driver", DriverName, "Version", driverVersion)
+func NewDriver(c cloud.Cloud, o *Options, m mounter.Mounter, md metadata.MetadataService, k kubernetes.Interface) (*Driver, error) {
+	klog.InfoS("Driver Information", "Driver", util.GetDriverName(), "Version", driverVersion)
+	initVariables()
 
-	driverOptions := DriverOptions{
-		endpoint: DefaultCSIEndpoint,
-		mode:     AllMode,
-	}
-	for _, option := range options {
-		option(&driverOptions)
+	if err := ValidateDriverOptions(o); err != nil {
+		return nil, fmt.Errorf("invalid driver options: %w", err)
 	}
 
-	if err := ValidateDriverOptions(&driverOptions); err != nil {
-		return nil, fmt.Errorf("Invalid driver options: %w", err)
+	driver := &Driver{
+		options: o,
 	}
 
-	driver := Driver{
-		options: &driverOptions,
-	}
-
-	switch driverOptions.mode {
+	switch o.Mode {
 	case ControllerMode:
-		driver.controllerService = newControllerService(&driverOptions)
+		driver.controller = NewControllerService(c, o)
 	case NodeMode:
-		driver.nodeService = newNodeService(&driverOptions)
+		driver.node = NewNodeService(o, md, m, k)
 	case AllMode:
-		driver.controllerService = newControllerService(&driverOptions)
-		driver.nodeService = newNodeService(&driverOptions)
+		driver.controller = NewControllerService(c, o)
+		driver.node = NewNodeService(o, md, m, k)
+	case MetadataLabelerMode:
+		return nil, fmt.Errorf("mode %s is not handled by the driver, it is handled separately in main", o.Mode)
 	default:
-		return nil, fmt.Errorf("unknown mode: %s", driverOptions.mode)
+		return nil, fmt.Errorf("unknown mode: %s", o.Mode)
 	}
 
-	return &driver, nil
+	return driver, nil
 }
 
 func (d *Driver) Run() error {
-	scheme, addr, err := util.ParseEndpoint(d.options.endpoint)
+	scheme, addr, err := util.ParseEndpoint(d.options.Endpoint, d.options.WindowsHostProcess)
 	if err != nil {
 		return err
 	}
 
-	listener, err := net.Listen(scheme, addr)
+	listenConfig := net.ListenConfig{}
+	listener, err := listenConfig.Listen(context.Background(), scheme, addr)
 	if err != nil {
 		return err
 	}
 
-	logErr := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	logErr := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		resp, err := handler(ctx, req)
 		if err != nil {
 			klog.ErrorS(err, "GRPC error")
 		}
 		return resp, err
 	}
+
 	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(logErr),
 	}
-	d.srv = grpc.NewServer(opts...)
 
+	if d.options.EnableOtelTracing {
+		opts = append(opts, grpc.StatsHandler(otelgrpc.NewServerHandler()))
+	}
+
+	d.srv = grpc.NewServer(opts...)
 	csi.RegisterIdentityServer(d.srv, d)
 
-	switch d.options.mode {
+	switch d.options.Mode {
 	case ControllerMode:
-		csi.RegisterControllerServer(d.srv, d)
+		csi.RegisterControllerServer(d.srv, d.controller)
+		rpc.RegisterModifyServer(d.srv, d.controller)
 	case NodeMode:
-		csi.RegisterNodeServer(d.srv, d)
+		csi.RegisterNodeServer(d.srv, d.node)
 	case AllMode:
-		csi.RegisterControllerServer(d.srv, d)
-		csi.RegisterNodeServer(d.srv, d)
+		csi.RegisterControllerServer(d.srv, d.controller)
+		csi.RegisterNodeServer(d.srv, d.node)
+		rpc.RegisterModifyServer(d.srv, d.controller)
+	case MetadataLabelerMode:
+		return fmt.Errorf("mode %s is not handled by the driver, it is handled separately in main", d.options.Mode)
 	default:
-		return fmt.Errorf("unknown mode: %s", d.options.mode)
+		return fmt.Errorf("unknown mode: %s", d.options.Mode)
 	}
 
 	klog.V(4).InfoS("Listening for connections", "address", listener.Addr())
@@ -146,55 +170,4 @@ func (d *Driver) Run() error {
 
 func (d *Driver) Stop() {
 	d.srv.Stop()
-}
-
-func WithEndpoint(endpoint string) func(*DriverOptions) {
-	return func(o *DriverOptions) {
-		o.endpoint = endpoint
-	}
-}
-
-func WithExtraTags(extraTags map[string]string) func(*DriverOptions) {
-	return func(o *DriverOptions) {
-		o.extraTags = extraTags
-	}
-}
-
-func WithExtraVolumeTags(extraVolumeTags map[string]string) func(*DriverOptions) {
-	return func(o *DriverOptions) {
-		if o.extraTags == nil && extraVolumeTags != nil {
-			klog.InfoS("DEPRECATION WARNING: --extra-volume-tags is deprecated, please use --extra-tags instead")
-			o.extraTags = extraVolumeTags
-		}
-	}
-}
-
-func WithMode(mode Mode) func(*DriverOptions) {
-	return func(o *DriverOptions) {
-		o.mode = mode
-	}
-}
-
-func WithVolumeAttachLimit(volumeAttachLimit int64) func(*DriverOptions) {
-	return func(o *DriverOptions) {
-		o.volumeAttachLimit = volumeAttachLimit
-	}
-}
-
-func WithKubernetesClusterID(clusterID string) func(*DriverOptions) {
-	return func(o *DriverOptions) {
-		o.kubernetesClusterID = clusterID
-	}
-}
-
-func WithAwsSdkDebugLog(enableSdkDebugLog bool) func(*DriverOptions) {
-	return func(o *DriverOptions) {
-		o.awsSdkDebugLog = enableSdkDebugLog
-	}
-}
-
-func WithWarnOnInvalidTag(warnOnInvalidTag bool) func(*DriverOptions) {
-	return func(o *DriverOptions) {
-		o.warnOnInvalidTag = warnOnInvalidTag
-	}
 }

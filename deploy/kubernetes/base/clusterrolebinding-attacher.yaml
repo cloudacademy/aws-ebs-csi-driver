@@ -9,8 +9,8 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: ebs-csi-controller-sa
-    namespace: default
 roleRef:
   kind: ClusterRole
   name: ebs-external-attacher-role
   apiGroup: rbac.authorization.k8s.io
+

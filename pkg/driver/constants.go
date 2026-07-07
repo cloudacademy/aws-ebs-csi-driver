@@ -16,47 +16,54 @@ limitations under the License.
 
 package driver
 
-// constants of keys in PublishContext
-const (
-	// devicePathKey represents key for device path in PublishContext
-	// devicePath is the device path where the volume is attached to
-	DevicePathKey = "devicePath"
+import (
+	"time"
 )
 
-// constants of keys in VolumeContext
+// constants of keys in PublishContext.
+const (
+	// DevicePathKey represents key for device path in PublishContext
+	// devicePath is the device path where the volume is attached to.
+	DevicePathKey = "devicePath"
+	// VolumeIDKey represents key for volume ID in PublishContext
+	// Used for node-local volumes to pass the real volume ID.
+	VolumeIDKey = "volumeID"
+)
+
+// constants of keys in VolumeContext.
 const (
 	// VolumeAttributePartition represents key for partition config in VolumeContext
-	// this represents the partition number on a device used to mount
+	// this represents the partition number on a device used to mount.
 	VolumeAttributePartition = "partition"
 )
 
-// constants of disk partition suffix
+// constants of keys in volume parameters.
 const (
-	diskPartitionSuffix     = ""
-	nvmeDiskPartitionSuffix = "p"
-)
-
-// constants of keys in volume parameters
-const (
-	// VolumeTypeKey represents key for volume type
+	// VolumeTypeKey represents key for volume type.
 	VolumeTypeKey = "type"
 
-	// IopsPerGBKey represents key for IOPS per GB
+	// IopsPerGBKey represents key for IOPS per GB.
 	IopsPerGBKey = "iopspergb"
 
-	// AllowAutoIOPSPerGBIncreaseKey represents key for allowing automatic increase of IOPS
+	// AllowAutoIOPSPerGBIncreaseKey represents key for allowing automatic increase of IOPS.
 	AllowAutoIOPSPerGBIncreaseKey = "allowautoiopspergbincrease"
 
-	// Iops represents key for IOPS for volume
+	// AllowAutoIOPSIncreaseOnModifyKey represents key for allowing IOPS increase on resizing if IopsPerGB is set to ensure desired ratio is maintained.
+	AllowAutoIOPSIncreaseOnModifyKey = "allowautoiopsincreaseonmodify"
+
+	// VolumeInitializationRateKey represents key for volume initialization rate when creating volumes from snapshots.
+	VolumeInitializationRateKey = "volumeinitializationrate"
+
+	// IopsKey represents key for IOPS for volume.
 	IopsKey = "iops"
 
-	// ThroughputKey represents key for throughput
+	// ThroughputKey represents key for throughput.
 	ThroughputKey = "throughput"
 
-	// EncryptedKey represents key for whether filesystem is encrypted
+	// EncryptedKey represents key for whether filesystem is encrypted.
 	EncryptedKey = "encrypted"
 
-	// KmsKeyId represents key for KMS encryption key
+	// KmsKeyIDKey represents key for KMS encryption key.
 	KmsKeyIDKey = "kmskeyid"
 
 	// PVCNameKey contains name of the PVC for which is a volume provisioned.
@@ -66,21 +73,77 @@ const (
 	PVCNamespaceKey = "csi.storage.k8s.io/pvc/namespace"
 
 	// PVNameKey contains name of the final PV that will be used for the dynamically
-	// provisioned volume
+	// provisioned volume.
 	PVNameKey = "csi.storage.k8s.io/pv/name"
 
-	// BlockExpressKey increases the iops limit for io2 volumes to the block express limit
-	BlockExpressKey = "blockexpress"
+	// VolumeSnapshotNameKey contains name of the snapshot.
+	VolumeSnapshotNameKey = "csi.storage.k8s.io/volumesnapshot/name"
 
-	// BlockSizeKey configures the block size when formatting a volume
+	// VolumeSnapshotNamespaceKey contains namespace of the snapshot.
+	VolumeSnapshotNamespaceKey = "csi.storage.k8s.io/volumesnapshot/namespace"
+
+	// VolumeSnapshotContentNameKey contains name of the VolumeSnapshotContent that is the source
+	// for the snapshot.
+	VolumeSnapshotContentNameKey = "csi.storage.k8s.io/volumesnapshotcontent/name"
+
+	// DeprecatedBlockExpressKey was previously `BlockExpressKey` now deprecated as all io2 volumes now support up to 256,000 IOPS.
+	// See https://docs.aws.amazon.com/ebs/latest/userguide/ebs-volume-types.html.
+	DeprecatedBlockExpressKey = "blockexpress"
+
+	// FSTypeKey configures the file system type that will be formatted during volume creation.
+	FSTypeKey = "csi.storage.k8s.io/fstype"
+
+	// BlockSizeKey configures the block size when formatting a volume.
 	BlockSizeKey = "blocksize"
 
+	// InodeSizeKey configures the inode size when formatting a volume.
+	InodeSizeKey = "inodesize"
+
+	// BytesPerInodeKey configures the `bytes-per-inode` when formatting a volume.
+	BytesPerInodeKey = "bytesperinode"
+
+	// NumberOfInodesKey configures the `number-of-inodes` when formatting a volume.
+	NumberOfInodesKey = "numberofinodes"
+
+	// Ext4BigAllocKey enables the bigalloc option when formatting an ext4 volume.
+	Ext4BigAllocKey = "ext4bigalloc"
+
+	// Ext4ClusterSizeKey configures the cluster size when formatting an ext4 volume with the bigalloc option enabled.
+	Ext4ClusterSizeKey = "ext4clustersize"
+
+	// Ext4EncryptionSupportKey enables the encrypt option when formatting an ext4 volume.
+	Ext4EncryptionSupportKey = "ext4encryptionsupport"
+
 	// TagKeyPrefix contains the prefix of a volume parameter that designates it as
-	// a tag to be attached to the resource
+	// a tag to be attached to the resource.
 	TagKeyPrefix = "tagSpecification"
+
+	// OutpostArnKey represents key for outpost's arn.
+	OutpostArnKey = "outpostarn"
+
+	// BlockAttachUntilInitializedKey will prevent restored volume from being attached until it is fully initialized.
+	BlockAttachUntilInitializedKey = "blockattachuntilinitialized"
 )
 
-// constants for volume tags and their values
+// constants of keys in snapshot parameters.
+const (
+	// FastSnapshotRestoreAvailabilityZones represents key for fast snapshot restore availability zones.
+	FastSnapshotRestoreAvailabilityZones = "fastsnapshotrestoreavailabilityzones"
+
+	// LockMode represents a key for indicating whether snapshots are locked in Governance or Compliance mode.
+	LockMode = "lockmode"
+
+	// LockDuration is a key for the duration for which to lock the snapshots, specified in days.
+	LockDuration = "lockduration"
+
+	// LockExpirationDate is a key for specifying the expiration date for the snapshot lock, specified in the format "YYYY-MM-DDThh:mm:ss.sssZ".
+	LockExpirationDate = "lockexpirationdate"
+
+	// LockCoolOffPeriod is a key specifying the cooling-off period for compliance mode, specified in hours.
+	LockCoolOffPeriod = "lockcooloffperiod"
+)
+
+// constants for volume tags and their values.
 const (
 	// ResourceLifecycleTagPrefix is prefix of tag for provisioned EBS volume that
 	// marks them as owned by the cluster. Used only when --cluster-id is set.
@@ -118,36 +181,75 @@ const (
 	// the external provisioner sidecar is started with --extra-create-metadata=true and
 	// thus provides such metadata to the CSI driver.
 	PVNameTag = "kubernetes.io/created-for/pv/name"
+
+	// ClusterNameTagKey is the resource tag key for cluster-scoped IAM policies.
+	ClusterNameTagKey = "ebs.csi.aws.com/cluster-name"
 )
 
-// constants for default command line flag values
+// constants for default command line flag values.
 const (
-	DefaultCSIEndpoint = "unix://tmp/csi.sock"
+	DefaultCSIEndpoint                       = "unix://tmp/csi.sock"
+	DefaultModifyVolumeRequestHandlerTimeout = 2 * time.Second
 )
 
-// constants for disk block size
+// constants for node-local volumes.
 const (
-	//DefaultBlockSize represents the default block size (4KB)
-	DefaultBlockSize = 4096
+	// NodeLocalVolumeHandlePrefix is the prefix for node-local volume handles.
+	NodeLocalVolumeHandlePrefix = "local-ebs://"
 )
 
-// constants for fstypes
+// constants for fstypes.
 const (
-	// FSTypeExt2 represents the ext2 filesystem type
-	FSTypeExt2 = "ext2"
-	// FSTypeExt3 represents the ext3 filesystem type
+	// FSTypeExt3 represents the ext3 filesystem type.
 	FSTypeExt3 = "ext3"
-	// FSTypeExt4 represents the ext4 filesystem type
+	// FSTypeExt4 represents the ext4 filesystem type.
 	FSTypeExt4 = "ext4"
-	// FSTypeXfs represents the xfs filesystem type
+	// FSTypeXfs represents the xfs filesystem type.
 	FSTypeXfs = "xfs"
-	// FSTypeNtfs represents the ntfs filesystem type
+	// FSTypeNtfs represents the ntfs filesystem type.
 	FSTypeNtfs = "ntfs"
 )
 
-// BlockSizeExcludedFSTypes contains the filesystems that a custom block size is *NOT* supported on
+type fileSystemConfig struct {
+	NotSupportedParams map[string]struct{}
+}
+
+func (fsConfig fileSystemConfig) isParameterSupported(paramName string) bool {
+	_, notSupported := fsConfig.NotSupportedParams[paramName]
+	return !notSupported
+}
+
 var (
-	BlockSizeExcludedFSTypes = map[string]struct{}{
-		FSTypeNtfs: {},
+	FileSystemConfigs = map[string]fileSystemConfig{
+		FSTypeExt3: {
+			NotSupportedParams: map[string]struct{}{
+				Ext4BigAllocKey:          {},
+				Ext4ClusterSizeKey:       {},
+				Ext4EncryptionSupportKey: {},
+			},
+		},
+		FSTypeExt4: {
+			NotSupportedParams: map[string]struct{}{},
+		},
+		FSTypeXfs: {
+			NotSupportedParams: map[string]struct{}{
+				BytesPerInodeKey:         {},
+				NumberOfInodesKey:        {},
+				Ext4BigAllocKey:          {},
+				Ext4ClusterSizeKey:       {},
+				Ext4EncryptionSupportKey: {},
+			},
+		},
+		FSTypeNtfs: {
+			NotSupportedParams: map[string]struct{}{
+				BlockSizeKey:             {},
+				InodeSizeKey:             {},
+				BytesPerInodeKey:         {},
+				NumberOfInodesKey:        {},
+				Ext4BigAllocKey:          {},
+				Ext4ClusterSizeKey:       {},
+				Ext4EncryptionSupportKey: {},
+			},
+		},
 	}
 )

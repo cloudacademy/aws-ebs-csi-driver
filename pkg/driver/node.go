@@ -18,36 +18,47 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
-	"strconv"
+	"runtime"
+	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
-	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/cloud"
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/cloud/limits"
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/cloud/metadata"
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/driver/internal"
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/mounter"
+	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/plugin"
 	"github.com/kubernetes-sigs/aws-ebs-csi-driver/pkg/util"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/volume"
 )
 
 const (
-	// default file system type to be used when it is not provided
+	// default file system type to be used when it is not provided.
 	defaultFsType = FSTypeExt4
 
-	// VolumeOperationAlreadyExists is message fmt returned to CO when there is another in-flight call on the given volumeID
+	// VolumeOperationAlreadyExists is message fmt returned to CO when there is another in-flight call on the given volumeID.
 	VolumeOperationAlreadyExists = "An operation with the given volume=%q is already in progress"
-
-	//sbeDeviceVolumeAttachmentLimit refers to the maximum number of volumes that can be attached to an instance on snow.
-	sbeDeviceVolumeAttachmentLimit = 10
 )
 
 var (
 	ValidFSTypes = map[string]struct{}{
-		FSTypeExt2: {},
 		FSTypeExt3: {},
 		FSTypeExt4: {},
 		FSTypeXfs:  {},
@@ -64,42 +75,38 @@ var (
 	}
 )
 
-// nodeService represents the node service of CSI driver
-type nodeService struct {
-	metadata         cloud.MetadataService
-	mounter          Mounter
-	deviceIdentifier DeviceIdentifier
-	inFlight         *internal.InFlight
-	driverOptions    *DriverOptions
+const (
+	// taintWatcherDuration is the maximum duration for the not-ready taint watcher to run.
+	taintWatcherDuration = 10 * time.Minute
+)
+
+// NodeService represents the node service of CSI driver.
+type NodeService struct {
+	metadata metadata.MetadataService
+	mounter  mounter.Mounter
+	inFlight *internal.InFlight
+	options  *Options
+	csi.UnimplementedNodeServer
 }
 
-// newNodeService creates a new node service
-// it panics if failed to create the service
-func newNodeService(driverOptions *DriverOptions) nodeService {
-	klog.V(5).InfoS("[Debug] Retrieving node info from metadata service")
-	region := os.Getenv("AWS_REGION")
-	klog.InfoS("regionFromSession Node service", "region", region)
-	metadata, err := cloud.NewMetadataService(cloud.DefaultEC2MetadataClient, cloud.DefaultKubernetesAPIClient, region)
-	if err != nil {
-		panic(err)
+// NewNodeService creates a new node service.
+func NewNodeService(o *Options, md metadata.MetadataService, m mounter.Mounter, k kubernetes.Interface) *NodeService {
+	if k != nil {
+		// Watch for the agent‑not‑ready taint for up to one minute and remove it
+		// as soon as allocatable is available.
+		go startNotReadyTaintWatcher(k, taintWatcherDuration)
 	}
 
-	nodeMounter, err := newNodeMounter()
-	if err != nil {
-		panic(err)
-	}
-
-	return nodeService{
-		metadata:         metadata,
-		mounter:          nodeMounter,
-		deviceIdentifier: newNodeDeviceIdentifier(),
-		inFlight:         internal.NewInFlight(),
-		driverOptions:    driverOptions,
+	return &NodeService{
+		metadata: md,
+		mounter:  m,
+		inFlight: internal.NewInFlight(),
+		options:  o,
 	}
 }
 
-func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	klog.V(4).InfoS("NodeStageVolume: called", "args", *req)
+func (d *NodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+	klog.V(4).InfoS("NodeStageVolume: called", "args", util.SanitizeRequest(req))
 
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
@@ -116,8 +123,14 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Error(codes.InvalidArgument, "Volume capability not provided")
 	}
 
-	if !isValidVolumeCapabilities([]*csi.VolumeCapability{volCap}) {
-		return nil, status.Error(codes.InvalidArgument, "Volume capability not supported")
+	if isNodeLocalVolume(volumeID) {
+		if !isValidCapabilityForNodeLocal(volCap) {
+			return nil, status.Error(codes.InvalidArgument, "Volume capability not supported")
+		}
+	} else {
+		if !isValidVolumeCapabilities([]*csi.VolumeCapability{volCap}) {
+			return nil, status.Error(codes.InvalidArgument, "Volume capability not supported")
+		}
 	}
 	volumeContext := req.GetVolumeContext()
 	if isValidVolumeContext := isValidVolumeContext(volumeContext); !isValidVolumeContext {
@@ -125,8 +138,7 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	// If the access type is block, do nothing for stage
-	switch volCap.GetAccessType().(type) {
-	case *csi.VolumeCapability_Block:
+	if _, isAccessTypeBlock := volCap.GetAccessType().(*csi.VolumeCapability_Block); isAccessTypeBlock {
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
@@ -146,24 +158,37 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	context := req.GetVolumeContext()
-	blockSize, ok := context[BlockSizeKey]
-	if ok {
-		// This check is already performed on the controller side
-		// However, because it is potentially security-sensitive, we redo it here to be safe
-		_, err := strconv.Atoi(blockSize)
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "Invalid blockSize (aborting!): %v", err)
-		}
 
-		// In the case that the default fstype does not support custom block sizes we could
-		// be using an invalid fstype, so recheck that here
-		if _, ok = BlockSizeExcludedFSTypes[strings.ToLower(fsType)]; ok {
-			return nil, status.Errorf(codes.InvalidArgument, "Cannot use block size with fstype %s", fsType)
-		}
-
+	blockSize, err := recheckFormattingOptionParameter(context, BlockSizeKey, FileSystemConfigs, fsType)
+	if err != nil {
+		return nil, err
+	}
+	inodeSize, err := recheckFormattingOptionParameter(context, InodeSizeKey, FileSystemConfigs, fsType)
+	if err != nil {
+		return nil, err
+	}
+	bytesPerInode, err := recheckFormattingOptionParameter(context, BytesPerInodeKey, FileSystemConfigs, fsType)
+	if err != nil {
+		return nil, err
+	}
+	numInodes, err := recheckFormattingOptionParameter(context, NumberOfInodesKey, FileSystemConfigs, fsType)
+	if err != nil {
+		return nil, err
+	}
+	ext4BigAlloc, err := recheckFormattingOptionParameter(context, Ext4BigAllocKey, FileSystemConfigs, fsType)
+	if err != nil {
+		return nil, err
+	}
+	ext4ClusterSize, err := recheckFormattingOptionParameter(context, Ext4ClusterSizeKey, FileSystemConfigs, fsType)
+	if err != nil {
+		return nil, err
+	}
+	ext4EncryptionSupport, err := recheckFormattingOptionParameter(context, Ext4EncryptionSupportKey, FileSystemConfigs, fsType)
+	if err != nil {
+		return nil, err
 	}
 
-	mountOptions := collectMountOptions(fsType, mountVolume.MountFlags)
+	mountOptions := collectMountOptions(fsType, mountVolume.GetMountFlags())
 
 	if ok = d.inFlight.Insert(volumeID); !ok {
 		return nil, status.Errorf(codes.Aborted, VolumeOperationAlreadyExists, volumeID)
@@ -173,7 +198,7 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		d.inFlight.Delete(volumeID)
 	}()
 
-	devicePath, ok := req.PublishContext[DevicePathKey]
+	devicePath, ok := req.GetPublishContext()[DevicePathKey]
 	if !ok {
 		return nil, status.Error(codes.InvalidArgument, "Device path not provided")
 	}
@@ -187,9 +212,16 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		}
 	}
 
-	source, err := d.findDevicePath(devicePath, volumeID, partition)
+	effectiveVolumeID := volumeID
+	if isNodeLocalVolume(volumeID) {
+		if realVolumeID, ok := req.GetPublishContext()[VolumeIDKey]; ok && realVolumeID != "" {
+			effectiveVolumeID = realVolumeID
+		}
+	}
+
+	source, err := d.mounter.FindDevicePath(devicePath, effectiveVolumeID, partition, d.metadata.GetRegion())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "Failed to find device path %s. %v", devicePath, err)
+		return nil, status.Errorf(codes.NotFound, "Failed to find device path %s. %v", devicePath, err)
 	}
 
 	klog.V(4).InfoS("NodeStageVolume: find device path", "devicePath", devicePath, "source", source)
@@ -220,19 +252,45 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	// This operation (NodeStageVolume) MUST be idempotent.
 	// If the volume corresponding to the volume_id is already staged to the staging_target_path,
 	// and is identical to the specified volume_capability the Plugin MUST reply 0 OK.
+	klog.V(4).InfoS("NodeStageVolume: checking if volume is already staged", "device", device, "source", source, "target", target)
 	if device == source {
 		klog.V(4).InfoS("NodeStageVolume: volume already staged", "volumeID", volumeID)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
 	// FormatAndMount will format only if needed
-	klog.V(4).InfoS("NodeStageVolume: formatting and mounting with fstype", "source", source, "target", target, "fstype", fsType)
+	klog.V(4).InfoS("NodeStageVolume: staging volume", "source", source, "volumeID", volumeID, "target", target, "fstype", fsType)
 	formatOptions := []string{}
 	if len(blockSize) > 0 {
 		if fsType == FSTypeXfs {
 			blockSize = "size=" + blockSize
 		}
 		formatOptions = append(formatOptions, "-b", blockSize)
+	}
+	if len(inodeSize) > 0 {
+		option := "-I"
+		if fsType == FSTypeXfs {
+			option, inodeSize = "-i", "size="+inodeSize
+		}
+		formatOptions = append(formatOptions, option, inodeSize)
+	}
+	if len(bytesPerInode) > 0 {
+		formatOptions = append(formatOptions, "-i", bytesPerInode)
+	}
+	if len(numInodes) > 0 {
+		formatOptions = append(formatOptions, "-N", numInodes)
+	}
+	if ext4BigAlloc == "true" {
+		formatOptions = append(formatOptions, "-O", "bigalloc")
+	}
+	if len(ext4ClusterSize) > 0 {
+		formatOptions = append(formatOptions, "-C", ext4ClusterSize)
+	}
+	if ext4EncryptionSupport == "true" {
+		formatOptions = append(formatOptions, "-O", "encrypt")
+	}
+	if fsType == FSTypeXfs && d.options.LegacyXFSProgs {
+		formatOptions = append(formatOptions, "-m", "bigtime=0,inobtcount=0,reflink=0", "-i", "nrext64=0")
 	}
 	err = d.mounter.FormatAndMountSensitiveWithFormatOptions(source, target, fsType, mountOptions, nil, formatOptions)
 	if err != nil {
@@ -246,20 +304,17 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	if needResize {
-		r, err := d.mounter.NewResizeFs()
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "Error attempting to create new ResizeFs:  %v", err)
-		}
 		klog.V(2).InfoS("Volume needs resizing", "source", source)
-		if _, err := r.Resize(source, target); err != nil {
+		if _, err := d.mounter.Resize(source, target); err != nil {
 			return nil, status.Errorf(codes.Internal, "Could not resize volume %q (%q):  %v", volumeID, source, err)
 		}
 	}
+	klog.V(4).InfoS("NodeStageVolume: successfully staged volume", "source", source, "volumeID", volumeID, "target", target, "fstype", fsType)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-func (d *nodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	klog.V(4).InfoS("NodeUnstageVolume: called", "args", *req)
+func (d *NodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+	klog.V(4).InfoS("NodeUnstageVolume: called", "args", req)
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -283,7 +338,7 @@ func (d *nodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	// returns the device name, reference count, and error code
 	dev, refCount, err := d.mounter.GetDeviceNameFromMount(target)
 	if err != nil {
-		msg := fmt.Sprintf("failed to check if volume is mounted: %v", err)
+		msg := fmt.Sprintf("failed to check if target %q is a mount point: %v", target, err)
 		return nil, status.Error(codes.Internal, msg)
 	}
 
@@ -304,12 +359,12 @@ func (d *nodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not unmount target %q: %v", target, err)
 	}
-
+	klog.V(4).InfoS("NodeUnStageVolume: successfully unstaged volume", "volumeID", volumeID, "target", target)
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
-func (d *nodeService) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	klog.V(4).Infof("NodeExpandVolume: called", "args", *req)
+func (d *NodeService) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+	klog.V(4).InfoS("NodeExpandVolume: called", "args", util.SanitizeRequest(req))
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -319,12 +374,20 @@ func (d *nodeService) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 		return nil, status.Error(codes.InvalidArgument, "volume path must be provided")
 	}
 
+	if ok := d.inFlight.Insert(volumeID); !ok {
+		return nil, status.Errorf(codes.Aborted, VolumeOperationAlreadyExists, volumeID)
+	}
+	defer func() {
+		klog.V(4).InfoS("NodeExpandVolume: volume operation finished", "volumeId", volumeID)
+		d.inFlight.Delete(volumeID)
+	}()
+
 	volumeCapability := req.GetVolumeCapability()
 	// VolumeCapability is optional, if specified, use that as source of truth
 	if volumeCapability != nil {
 		caps := []*csi.VolumeCapability{volumeCapability}
 		if !isValidVolumeCapabilities(caps) {
-			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("VolumeCapability is invalid: %v", volumeCapability))
+			return nil, status.Error(codes.InvalidArgument, ("VolumeCapability is invalid"))
 		}
 
 		if blk := volumeCapability.GetBlock(); blk != nil {
@@ -335,50 +398,43 @@ func (d *nodeService) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandV
 	} else {
 		// TODO use util.GenericResizeFS
 		// VolumeCapability is nil, check if volumePath point to a block device
-		isBlock, err := d.IsBlockDevice(volumePath)
+		isBlock, err := d.mounter.IsBlockDevice(volumePath)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to determine if volumePath [%v] is a block device: %v", volumePath, err)
 		}
 		if isBlock {
 			// Skip resizing for Block NodeExpandVolume
-			bcap, err := d.getBlockSizeBytes(volumePath)
+			bcap, err := d.mounter.GetBlockSizeBytes(volumePath)
 			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to get block capacity on path %s: %v", req.VolumePath, err)
+				return nil, status.Errorf(codes.Internal, "failed to get block capacity on path %s: %v", req.GetVolumePath(), err)
 			}
 			klog.V(4).InfoS("NodeExpandVolume: called, since given volumePath is a block device, ignoring...", "volumeID", volumeID, "volumePath", volumePath)
 			return &csi.NodeExpandVolumeResponse{CapacityBytes: bcap}, nil
 		}
 	}
-
 	deviceName, _, err := d.mounter.GetDeviceNameFromMount(volumePath)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get device name from mount %s: %v", volumePath, err)
 	}
 
-	devicePath, err := d.findDevicePath(deviceName, volumeID, "")
+	devicePath, err := d.mounter.FindDevicePath(deviceName, volumeID, "", d.metadata.GetRegion())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to find device path for device name %s for mount %s: %v", deviceName, req.GetVolumePath(), err)
+		return nil, status.Errorf(codes.NotFound, "failed to find device path for device name %s for mount %s: %v", deviceName, req.GetVolumePath(), err)
 	}
 
-	r, err := d.mounter.NewResizeFs()
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "Error attempting to create new ResizeFs:  %v", err)
+	if _, err = d.mounter.Resize(devicePath, volumePath); err != nil {
+		return nil, status.Errorf(codes.Internal, "Could not resize volume %q (%q): %v", volumeID, devicePath, err)
 	}
 
-	// TODO: lock per volume ID to have some idempotency
-	if _, err = r.Resize(devicePath, volumePath); err != nil {
-		return nil, status.Errorf(codes.Internal, "Could not resize volume %q (%q):  %v", volumeID, devicePath, err)
-	}
-
-	bcap, err := d.getBlockSizeBytes(devicePath)
+	bcap, err := d.mounter.GetBlockSizeBytes(devicePath)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get block capacity on path %s: %v", req.VolumePath, err)
+		return nil, status.Errorf(codes.Internal, "failed to get block capacity on path %s: %v", req.GetVolumePath(), err)
 	}
 	return &csi.NodeExpandVolumeResponse{CapacityBytes: bcap}, nil
 }
 
-func (d *nodeService) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	klog.V(4).InfoS("NodePublishVolume: called", "args", *req)
+func (d *NodeService) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+	klog.V(4).InfoS("NodePublishVolume: called", "args", util.SanitizeRequest(req))
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -399,8 +455,14 @@ func (d *nodeService) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Error(codes.InvalidArgument, "Volume capability not provided")
 	}
 
-	if !isValidVolumeCapabilities([]*csi.VolumeCapability{volCap}) {
-		return nil, status.Error(codes.InvalidArgument, "Volume capability not supported")
+	if isNodeLocalVolume(volumeID) {
+		if !isValidCapabilityForNodeLocal(volCap) {
+			return nil, status.Error(codes.InvalidArgument, "Volume capability not supported")
+		}
+	} else {
+		if !isValidVolumeCapabilities([]*csi.VolumeCapability{volCap}) {
+			return nil, status.Error(codes.InvalidArgument, "Volume capability not supported")
+		}
 	}
 
 	if ok := d.inFlight.Insert(volumeID); !ok {
@@ -430,8 +492,8 @@ func (d *nodeService) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
-func (d *nodeService) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	klog.V(4).InfoS("NodeUnpublishVolume: called", "args", *req)
+func (d *NodeService) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+	klog.V(4).InfoS("NodeUnpublishVolume: called", "args", util.SanitizeRequest(req))
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -441,11 +503,13 @@ func (d *nodeService) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	if len(target) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Target path not provided")
 	}
+
 	if ok := d.inFlight.Insert(volumeID); !ok {
 		return nil, status.Errorf(codes.Aborted, VolumeOperationAlreadyExists, volumeID)
 	}
+
 	defer func() {
-		klog.V(4).InfoS("NodeUnPublishVolume: volume operation finished", "volumeId", volumeID)
+		klog.V(4).InfoS("NodeUnpublishVolume: volume operation finished", "volumeId", volumeID)
 		d.inFlight.Delete(volumeID)
 	}()
 
@@ -458,32 +522,32 @@ func (d *nodeService) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
-func (d *nodeService) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
-	klog.V(4).InfoS("NodeGetVolumeStats: called", "args", *req)
-	if len(req.VolumeId) == 0 {
+func (d *NodeService) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+	klog.V(4).InfoS("NodeGetVolumeStats: called", "args", req)
+	if len(req.GetVolumeId()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "NodeGetVolumeStats volume ID was empty")
 	}
-	if len(req.VolumePath) == 0 {
+	if len(req.GetVolumePath()) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "NodeGetVolumeStats volume path was empty")
 	}
 
-	exists, err := d.mounter.PathExists(req.VolumePath)
+	exists, err := d.mounter.PathExists(req.GetVolumePath())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "unknown error when stat on %s: %v", req.VolumePath, err)
+		return nil, status.Errorf(codes.Internal, "unknown error when stat on %s: %v", req.GetVolumePath(), err)
 	}
 	if !exists {
-		return nil, status.Errorf(codes.NotFound, "path %s does not exist", req.VolumePath)
+		return nil, status.Errorf(codes.NotFound, "path %s does not exist", req.GetVolumePath())
 	}
 
-	isBlock, err := d.IsBlockDevice(req.VolumePath)
+	isBlock, err := d.mounter.IsBlockDevice(req.GetVolumePath())
 
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to determine whether %s is block device: %v", req.VolumePath, err)
+		return nil, status.Errorf(codes.Internal, "failed to determine whether %s is block device: %v", req.GetVolumePath(), err)
 	}
 	if isBlock {
-		bcap, blockErr := d.getBlockSizeBytes(req.VolumePath)
+		bcap, blockErr := d.mounter.GetBlockSizeBytes(req.GetVolumePath())
 		if blockErr != nil {
-			return nil, status.Errorf(codes.Internal, "failed to get block capacity on path %s: %v", req.VolumePath, err)
+			return nil, status.Errorf(codes.Internal, "failed to get block capacity on path %s: %v", req.GetVolumePath(), blockErr)
 		}
 		return &csi.NodeGetVolumeStatsResponse{
 			Usage: []*csi.VolumeUsage{
@@ -495,35 +559,36 @@ func (d *nodeService) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVo
 		}, nil
 	}
 
-	metricsProvider := volume.NewMetricsStatFS(req.VolumePath)
-
-	metrics, err := metricsProvider.GetMetrics()
+	stats, err := d.mounter.GetVolumeStats(req.GetVolumePath())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get fs info on path %s: %v", req.VolumePath, err)
+		return nil, status.Errorf(codes.Internal, "failed to get fs info on path %s: %v", req.GetVolumePath(), err)
+	}
+
+	usage := []*csi.VolumeUsage{
+		{
+			Unit:      csi.VolumeUsage_BYTES,
+			Available: stats.AvailableBytes,
+			Total:     stats.TotalBytes,
+			Used:      stats.UsedBytes,
+		},
+	}
+	if stats.TotalInodes != 0 {
+		usage = append(usage, &csi.VolumeUsage{
+			Unit:      csi.VolumeUsage_INODES,
+			Available: stats.AvailableInodes,
+			Total:     stats.TotalInodes,
+			Used:      stats.UsedInodes,
+		})
 	}
 
 	return &csi.NodeGetVolumeStatsResponse{
-		Usage: []*csi.VolumeUsage{
-			{
-				Unit:      csi.VolumeUsage_BYTES,
-				Available: metrics.Available.AsDec().UnscaledBig().Int64(),
-				Total:     metrics.Capacity.AsDec().UnscaledBig().Int64(),
-				Used:      metrics.Used.AsDec().UnscaledBig().Int64(),
-			},
-			{
-				Unit:      csi.VolumeUsage_INODES,
-				Available: metrics.InodesFree.AsDec().UnscaledBig().Int64(),
-				Total:     metrics.Inodes.AsDec().UnscaledBig().Int64(),
-				Used:      metrics.InodesUsed.AsDec().UnscaledBig().Int64(),
-			},
-		},
+		Usage: usage,
 	}, nil
-
 }
 
-func (d *nodeService) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	klog.V(4).InfoS("NodeGetCapabilities: called", "args", *req)
-	var caps []*csi.NodeServiceCapability
+func (d *NodeService) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+	klog.V(4).InfoS("NodeGetCapabilities: called", "args", req)
+	caps := make([]*csi.NodeServiceCapability, 0, len(nodeCaps))
 	for _, cap := range nodeCaps {
 		c := &csi.NodeServiceCapability{
 			Type: &csi.NodeServiceCapability_Rpc{
@@ -537,13 +602,20 @@ func (d *nodeService) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetC
 	return &csi.NodeGetCapabilitiesResponse{Capabilities: caps}, nil
 }
 
-func (d *nodeService) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	klog.V(4).Infof("NodeGetInfo: called", "args", *req)
+func (d *NodeService) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+	klog.V(4).InfoS("NodeGetInfo: called", "args", req)
+
+	if err := d.metadata.UpdateMetadata(); err != nil {
+		klog.ErrorS(err, "Failed to update metadata, using cached values")
+	}
 
 	zone := d.metadata.GetAvailabilityZone()
+	osType := runtime.GOOS
 
 	segments := map[string]string{
-		TopologyKey: zone,
+		ZoneTopologyKey:          zone,
+		WellKnownZoneTopologyKey: zone,
+		OSTopologyKey:            osType,
 	}
 
 	outpostArn := d.metadata.GetOutpostArn()
@@ -556,21 +628,26 @@ func (d *nodeService) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoReque
 		segments[AwsOutpostIDKey] = outpostArn.Resource
 	}
 
-	topology := &csi.Topology{Segments: segments}
+	if p := plugin.GetPlugin(); p != nil {
+		maps.Copy(segments, p.GetNodeTopologySegments())
+	}
 
+	topology := &csi.Topology{Segments: segments}
+	maxVolumesPerNode := d.getVolumesLimit()
+	klog.V(4).InfoS("NodeGetInfo:", "maxVolumesPerNode", maxVolumesPerNode)
 	return &csi.NodeGetInfoResponse{
 		NodeId:             d.metadata.GetInstanceID(),
-		MaxVolumesPerNode:  d.getVolumesLimit(),
+		MaxVolumesPerNode:  maxVolumesPerNode,
 		AccessibleTopology: topology,
 	}, nil
 }
 
-func (d *nodeService) nodePublishVolumeForBlock(req *csi.NodePublishVolumeRequest, mountOptions []string) error {
+func (d *NodeService) nodePublishVolumeForBlock(req *csi.NodePublishVolumeRequest, mountOptions []string) error {
 	target := req.GetTargetPath()
 	volumeID := req.GetVolumeId()
 	volumeContext := req.GetVolumeContext()
 
-	devicePath, exists := req.PublishContext[DevicePathKey]
+	devicePath, exists := req.GetPublishContext()[DevicePathKey]
 	if !exists {
 		return status.Error(codes.InvalidArgument, "Device path not provided")
 	}
@@ -587,9 +664,16 @@ func (d *nodeService) nodePublishVolumeForBlock(req *csi.NodePublishVolumeReques
 		}
 	}
 
-	source, err := d.findDevicePath(devicePath, volumeID, partition)
+	effectiveVolumeID := volumeID
+	if isNodeLocalVolume(volumeID) {
+		if realVolumeID, ok := req.GetPublishContext()[VolumeIDKey]; ok && realVolumeID != "" {
+			effectiveVolumeID = realVolumeID
+		}
+	}
+
+	source, err := d.mounter.FindDevicePath(devicePath, effectiveVolumeID, partition, d.metadata.GetRegion())
 	if err != nil {
-		return status.Errorf(codes.Internal, "Failed to find device path %s. %v", devicePath, err)
+		return status.Errorf(codes.NotFound, "Failed to find device path %s. %v", devicePath, err)
 	}
 
 	klog.V(4).InfoS("NodePublishVolume [block]: find device path", "devicePath", devicePath, "source", source)
@@ -610,6 +694,9 @@ func (d *nodeService) nodePublishVolumeForBlock(req *csi.NodePublishVolumeReques
 	}
 
 	// Create the mount point as a file since bind mount device node requires it to be a file
+	// This implementation detail is relied upon by the NVMECollector,
+	// which discovers block devices by parsing /proc/self/mountinfo. The bind mount
+	// created here ensures block devices appear in mountinfo even without a filesystem.
 	klog.V(4).InfoS("NodePublishVolume [block]: making target file", "target", target)
 	if err = d.mounter.MakeFile(target); err != nil {
 		if removeErr := os.Remove(target); removeErr != nil {
@@ -618,7 +705,7 @@ func (d *nodeService) nodePublishVolumeForBlock(req *csi.NodePublishVolumeReques
 		return status.Errorf(codes.Internal, "Could not create file %q: %v", target, err)
 	}
 
-	//Checking if the target file is already mounted with a device.
+	// Checking if the target file is already mounted with a device.
 	mounted, err := d.isMounted(source, target)
 	if err != nil {
 		return status.Errorf(codes.Internal, "Could not check if %q is mounted: %v", target, err)
@@ -641,7 +728,7 @@ func (d *nodeService) nodePublishVolumeForBlock(req *csi.NodePublishVolumeReques
 
 // isMounted checks if target is mounted. It does NOT return an error if target
 // doesn't exist.
-func (d *nodeService) isMounted(_ string, target string) (bool, error) {
+func (d *NodeService) isMounted(_ string, target string) (bool, error) {
 	/*
 		Checking if it's a mount point using IsLikelyNotMountPoint. There are three different return values,
 		1. true, err when the directory does not exist or corrupted.
@@ -650,14 +737,14 @@ func (d *nodeService) isMounted(_ string, target string) (bool, error) {
 	*/
 	notMnt, err := d.mounter.IsLikelyNotMountPoint(target)
 	if err != nil && !os.IsNotExist(err) {
-		//Checking if the path exists and error is related to Corrupted Mount, in that case, the system could unmount and mount.
+		// Checking if the path exists and error is related to Corrupted Mount, in that case, the system could unmount and mount.
 		_, pathErr := d.mounter.PathExists(target)
 		if pathErr != nil && d.mounter.IsCorruptedMnt(pathErr) {
 			klog.V(4).InfoS("NodePublishVolume: Target path is a corrupted mount. Trying to unmount.", "target", target)
 			if mntErr := d.mounter.Unpublish(target); mntErr != nil {
 				return false, status.Errorf(codes.Internal, "Unable to unmount the target %q : %v", target, mntErr)
 			}
-			//After successful unmount, the device is ready to be mounted.
+			// After successful unmount, the device is ready to be mounted.
 			return false, nil
 		}
 		return false, status.Errorf(codes.Internal, "Could not check if %q is a mount point: %v, %v", target, err, pathErr)
@@ -681,22 +768,22 @@ func (d *nodeService) isMounted(_ string, target string) (bool, error) {
 	return !notMnt, nil
 }
 
-func (d *nodeService) nodePublishVolumeForFileSystem(req *csi.NodePublishVolumeRequest, mountOptions []string, mode *csi.VolumeCapability_Mount) error {
+func (d *NodeService) nodePublishVolumeForFileSystem(req *csi.NodePublishVolumeRequest, mountOptions []string, mode *csi.VolumeCapability_Mount) error {
 	target := req.GetTargetPath()
 	source := req.GetStagingTargetPath()
 	if m := mode.Mount; m != nil {
-		for _, f := range m.MountFlags {
+		for _, f := range m.GetMountFlags() {
 			if !hasMountOption(mountOptions, f) {
 				mountOptions = append(mountOptions, f)
 			}
 		}
 	}
 
-	if err := d.preparePublishTarget(target); err != nil {
-		return status.Errorf(codes.Internal, err.Error())
+	if err := d.mounter.PreparePublishTarget(target); err != nil {
+		return status.Errorf(codes.Internal, "%s", err.Error())
 	}
 
-	//Checking if the target directory is already mounted with a device.
+	// Checking if the target directory is already mounted with a device.
 	mounted, err := d.isMounted(source, target)
 	if err != nil {
 		return status.Errorf(codes.Internal, "Could not check if %q is mounted: %v", target, err)
@@ -723,59 +810,47 @@ func (d *nodeService) nodePublishVolumeForFileSystem(req *csi.NodePublishVolumeR
 	return nil
 }
 
-// getVolumesLimit returns the limit of volumes that the node supports
-func (d *nodeService) getVolumesLimit() int64 {
-	if d.driverOptions.volumeAttachLimit >= 0 {
-		return d.driverOptions.volumeAttachLimit
-	}
-
-	if util.IsSBE(d.metadata.GetRegion()) {
-		return sbeDeviceVolumeAttachmentLimit
+// getVolumesLimit returns the limit of volumes that the node supports.
+func (d *NodeService) getVolumesLimit() int64 {
+	if d.options.VolumeAttachLimit >= 0 {
+		klog.V(4).InfoS("getVolumesLimit: VolumeAttachLimit manually set to", d.options.VolumeAttachLimit, "overriding the default value")
+		return d.options.VolumeAttachLimit
 	}
 
 	instanceType := d.metadata.GetInstanceType()
+	availableAttachments, limitType := limits.GetVolumeLimits(instanceType)
+	klog.V(4).InfoS("getVolumesLimit: Retrieved inputs", "instanceType", instanceType, "attachmentLimit", availableAttachments, "limitType", limitType)
 
-	isNitro := cloud.IsNitroInstanceType(instanceType)
-	availableAttachments := cloud.GetMaxAttachments(isNitro)
-	blockVolumes := d.metadata.GetNumBlockDeviceMappings()
+	// Calculate reserved volume attachments (additional EBS volumes)
+	reservedVolumeAttachments := d.options.ReservedVolumeAttachments
+	if reservedVolumeAttachments == -1 {
+		// Auto-detect number of reserved volume attachments - plus 1 to account for the root volume
+		reservedVolumeAttachments = d.metadata.GetNumBlockDeviceMappings() + 1
+	}
+	klog.V(4).InfoS("getVolumesLimit: Removing reserved attachments", "reservedVolumeAttachments", reservedVolumeAttachments)
+	availableAttachments -= reservedVolumeAttachments
 
-	// For Nitro instances, attachments are shared between EBS volumes, ENIs and NVMe instance stores
-	if isNitro {
+	// For shared attachment types, subtract ENIs
+	if limitType == util.AttachmentShared {
 		enis := d.metadata.GetNumAttachedENIs()
-		nvmeInstanceStoreVolumes := cloud.GetNVMeInstanceStoreVolumesForInstanceType(instanceType)
-		availableAttachments = availableAttachments - enis - nvmeInstanceStoreVolumes
-	}
-	availableAttachments = availableAttachments - blockVolumes
-
-	if availableAttachments < 0 {
-		availableAttachments = 0
+		klog.V(4).InfoS("getVolumesLimit: Removing ENIs on shared limit", "enis", enis)
+		availableAttachments -= (enis - 1)
 	}
 
-	maxEBSAttachments, ok := cloud.GetEBSLimitForInstanceType(instanceType)
-	if ok {
-		availableAttachments = min(maxEBSAttachments, availableAttachments)
+	// Safety measure: Never return a limit of below 1, as Kubernetes will treat it as infinite
+	if availableAttachments <= 0 {
+		availableAttachments = 1
 	}
 
+	klog.V(4).InfoS("getVolumesLimit: Returning calculated limit", "availableAttachments", availableAttachments)
 	return int64(availableAttachments)
-}
-
-func min(x, y int) int {
-	if x <= y {
-		return x
-	}
-	return y
 }
 
 // hasMountOption returns a boolean indicating whether the given
 // slice already contains a mount option. This is used to prevent
 // passing duplicate option to the mount command.
 func hasMountOption(options []string, opt string) bool {
-	for _, o := range options {
-		if o == opt {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(options, opt)
 }
 
 // collectMountOptions returns array of mount options from
@@ -797,4 +872,238 @@ func collectMountOptions(fsType string, mntFlags []string) []string {
 		}
 	}
 	return options
+}
+
+// startNotReadyTaintWatcher launches a short‑lived Node informer that removes the
+// ebs.csi.aws.com/agent‑not‑ready taint. The informer is stopped after maxWatchDuration.
+func startNotReadyTaintWatcher(clientset kubernetes.Interface, maxWatchDuration time.Duration) {
+	if os.Getenv("DISABLE_TAINT_WATCHER") != "" {
+		klog.V(4).InfoS("DISABLE_TAINT_WATCHER set, skipping taint watcher")
+		return
+	}
+	nodeName := os.Getenv("CSI_NODE_NAME")
+	if nodeName == "" {
+		klog.V(4).InfoS("CSI_NODE_NAME missing, skipping taint watcher")
+		return
+	}
+
+	factory := informers.NewSharedInformerFactoryWithOptions(
+		clientset,
+		5*time.Second, // Resync every 5 seconds in case of networking or other rare issue
+		informers.WithTweakListOptions(func(lo *metav1.ListOptions) {
+			lo.FieldSelector = "metadata.name=" + nodeName
+		}),
+	)
+	informer := factory.Core().V1().Nodes().Informer()
+
+	var mutex sync.Mutex
+	// Add additional 90 seconds to the context for the last-try taint removal
+	ctx, cancel := context.WithTimeout(context.Background(), maxWatchDuration+90*time.Second)
+	defer cancel()
+	attemptTaintRemoval := func(n *corev1.Node) {
+		if !hasNotReadyTaint(n) {
+			// Node has no taint, do nothing
+			return
+		}
+
+		if !mutex.TryLock() {
+			// Another removal thread is already running, do nothing
+			return
+		}
+		defer mutex.Unlock()
+
+		backoff := wait.Backoff{
+			Duration: 2 * time.Second,
+			Factor:   1.5,
+			Steps:    5,
+		}
+		err := wait.ExponentialBackoffWithContext(ctx, backoff, func(ctx context.Context) (bool, error) {
+			if err := removeNotReadyTaint(ctx, clientset, n); err != nil {
+				if apierrors.IsBadRequest(err) || apierrors.IsInvalid(err) || apierrors.IsNotFound(err) {
+					// Our node is probably stale, get a new copy
+					freshNode, nodeErr := clientset.CoreV1().Nodes().Get(ctx, n.Name, metav1.GetOptions{})
+					if nodeErr != nil {
+						klog.ErrorS(nodeErr, "Failed to update potentially stale node", "node", n.Name)
+						return false, nil // Continue retrying with old node
+					}
+					// Check if taint was already removed by another attempt
+					if !hasNotReadyTaint(freshNode) {
+						return true, nil // Taint is gone, we're done
+					}
+					n = freshNode // Update to fresh node for next retry
+				}
+				klog.ErrorS(err, "Failed to remove agent-not-ready taint, retrying", "node", n.Name)
+				return false, nil // Continue retrying
+			}
+			// We either removed the taint, or there was no taint to remove
+			return true, nil
+		})
+
+		if err != nil {
+			klog.ErrorS(err, "Timed out trying to remove agent-not-ready taint", "node", n.Name)
+		}
+	}
+
+	if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			if n, ok := obj.(*corev1.Node); ok {
+				attemptTaintRemoval(n)
+			}
+		},
+		UpdateFunc: func(_, newObj any) {
+			if n, ok := newObj.(*corev1.Node); ok {
+				attemptTaintRemoval(n)
+			}
+		},
+	}); err != nil {
+		klog.ErrorS(err, "Taint‑watcher: failed to add event handler")
+		return
+	}
+	if err := informer.SetWatchErrorHandlerWithContext(func(handlerCtx context.Context, r *cache.Reflector, err error) {
+		if apierrors.IsUnauthorized(err) || apierrors.IsForbidden(err) {
+			// Informer doesn't have permission - cancel context
+			// to avoid spamming logs with informer errors
+			klog.V(8).InfoS("Taint-watcher: permission error, silently cancelling context")
+			cancel()
+		} else {
+			cache.DefaultWatchErrorHandler(handlerCtx, r, err)
+		}
+	}); err != nil {
+		klog.ErrorS(err, "Taint‑watcher: failed to add error handler")
+		return
+	}
+
+	factory.Start(ctx.Done())
+	if ok := cache.WaitForCacheSync(ctx.Done(), informer.HasSynced); !ok {
+		if ctx.Err() != nil {
+			// Context likely cancelled because of permissions error - log at higher
+			// verbosity in this case to avoid spamming logs of users that have
+			// modified their permissions to opt out
+			klog.V(8).InfoS("Taint-watcher: cache sync cancelled (likely permissions error)")
+		} else {
+			klog.ErrorS(nil, "Taint-watcher: cache sync failed")
+		}
+	} else {
+		// Immediate scan in case the taint is already present and no event fires
+		if obj, exists, err := informer.GetStore().GetByKey(nodeName); err == nil && exists {
+			if n, ok := obj.(*corev1.Node); ok {
+				attemptTaintRemoval(n)
+			}
+		}
+
+		// Informer is operational - wait for maxWatchDuration for it to handle Node updates
+		<-time.After(maxWatchDuration)
+		klog.V(8).InfoS("Taint-watcher: timeout reached; stopping")
+	}
+
+	// Try to remove the taint one last time in case we got extremely unlucky with the informer
+	// We still try this even if the informer failed, as we may only be missing the watch permission
+	lastChanceNode, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		klog.ErrorS(err, "Failed to get node for last chance taint removal", "node", nodeName)
+	} else {
+		attemptTaintRemoval(lastChanceNode)
+	}
+}
+
+func hasNotReadyTaint(n *corev1.Node) bool {
+	for _, t := range n.Spec.Taints {
+		if t.Key == AgentNotReadyNodeTaintKey {
+			return true
+		}
+	}
+	return false
+}
+
+// JSONPatch struct for JSON patch operations.
+type JSONPatch struct {
+	OP    string `json:"op,omitempty"`
+	Path  string `json:"path,omitempty"`
+	Value any    `json:"value"`
+}
+
+// removeNotReadyTaint removes the taint ebs.csi.aws.com/agent-not-ready from the local node
+// This taint can be optionally applied by users to prevent startup race conditions such as
+// https://github.com/kubernetes/kubernetes/issues/95911
+func removeNotReadyTaint(ctx context.Context, clientset kubernetes.Interface, node *corev1.Node) error {
+	err := checkAllocatable(ctx, clientset, node.Name)
+	if err != nil {
+		return err
+	}
+
+	var taintsToKeep []corev1.Taint
+	for _, taint := range node.Spec.Taints {
+		if taint.Key != AgentNotReadyNodeTaintKey {
+			taintsToKeep = append(taintsToKeep, taint)
+		} else {
+			klog.V(4).InfoS("Queued taint for removal", "key", taint.Key, "effect", taint.Effect)
+		}
+	}
+
+	if len(taintsToKeep) == len(node.Spec.Taints) {
+		klog.V(4).InfoS("No taints to remove on node, skipping taint removal")
+		return nil
+	}
+
+	patchRemoveTaints := []JSONPatch{
+		{
+			OP:    "test",
+			Path:  "/spec/taints",
+			Value: node.Spec.Taints,
+		},
+		{
+			OP:    "replace",
+			Path:  "/spec/taints",
+			Value: taintsToKeep,
+		},
+	}
+
+	patch, err := json.Marshal(patchRemoveTaints)
+	if err != nil {
+		return err
+	}
+
+	_, err = clientset.CoreV1().Nodes().Patch(ctx, node.Name, k8stypes.JSONPatchType, patch, metav1.PatchOptions{})
+	if err != nil {
+		return err
+	}
+	klog.InfoS("Removed taint(s) from local node", "node", node.Name)
+	return nil
+}
+
+func checkAllocatable(ctx context.Context, clientset kubernetes.Interface, nodeName string) error {
+	csiNode, err := clientset.StorageV1().CSINodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("isAllocatableSet: failed to get CSINode for %s: %w", nodeName, err)
+	}
+
+	for _, driver := range csiNode.Spec.Drivers {
+		if driver.Name == util.GetDriverName() {
+			if driver.Allocatable != nil && driver.Allocatable.Count != nil {
+				klog.V(4).InfoS("CSINode Allocatable value is set", "nodeName", nodeName, "count", *driver.Allocatable.Count)
+				return nil
+			}
+			return fmt.Errorf("isAllocatableSet: allocatable value not set for driver on node %s", nodeName)
+		}
+	}
+
+	return fmt.Errorf("isAllocatableSet: driver not found on node %s", nodeName)
+}
+
+func recheckFormattingOptionParameter(context map[string]string, key string, fsConfigs map[string]fileSystemConfig, fsType string) (value string, err error) {
+	v, ok := context[key]
+	if ok {
+		// This check is already performed on the controller side
+		// However, because it is potentially security-sensitive, we redo it here to be safe
+		if isAlphanumeric := util.StringIsAlphanumeric(v); !isAlphanumeric {
+			return "", status.Errorf(codes.InvalidArgument, "Invalid %s (aborting!): %v", key, err)
+		}
+
+		// In the case that the default fstype does not support custom sizes we could
+		// be using an invalid fstype, so recheck that here
+		if supported := fsConfigs[strings.ToLower(fsType)].isParameterSupported(key); !supported {
+			return "", status.Errorf(codes.InvalidArgument, "Cannot use %s with fstype %s", key, fsType)
+		}
+	}
+	return v, nil
 }
